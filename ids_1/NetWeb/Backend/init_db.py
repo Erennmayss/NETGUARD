@@ -53,7 +53,7 @@ def init_database():
                 username VARCHAR(100) NOT NULL,
                 password BYTEA NOT NULL,
                 nb_ports INT DEFAULT 24,
-                statut VARCHAR(20) DEFAULT 'UNKNOWN'
+                status VARCHAR(20) DEFAULT 'UNKNOWN'
             );
         """
         )

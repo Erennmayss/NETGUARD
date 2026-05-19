@@ -1,5 +1,6 @@
 from flask import Blueprint, jsonify, request
 from Database.db import get_db_connection
+from services.switch_sync import ensure_switch_sync_schema
 import ipaddress
 import logging
 import os
@@ -740,6 +741,8 @@ def get_vlans():
     try:
         columns = get_vlan_columns(conn)
         cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
+        ensure_switch_sync_schema(cur)
+        conn.commit()
 
         where_clauses = []
         params = []
@@ -806,6 +809,8 @@ def get_switchs():
     conn = get_db_connection()
     try:
         cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
+        ensure_switch_sync_schema(cur)
+        conn.commit()
         cur.execute("""
             SELECT id_switch, nom, ip, status
             FROM switchs

@@ -1,12 +1,27 @@
 from flask import Blueprint, request, jsonify
 from flask_jwt_extended import jwt_required
 from Database.db import get_db_connection
-from services.switch_sync import sync_switch_state
+from services.switch_sync import ensure_switch_sync_schema, sync_switch_state
 import psycopg2.extras
 import logging
 
 equipements_bp = Blueprint('equipements', __name__)
 logger = logging.getLogger(__name__)
+
+
+def _prepare_switch_password(cur, password):
+    cur.execute(
+        """
+        SELECT data_type
+        FROM information_schema.columns
+        WHERE table_name = 'switchs' AND column_name = 'password'
+        """
+    )
+    row = cur.fetchone()
+    data_type = (row["data_type"] if hasattr(row, "get") else row[0]) if row else ""
+    if data_type == "bytea" and isinstance(password, str):
+        return password.encode()
+    return password
 
 
 def _row_to_switch(row):
@@ -47,6 +62,8 @@ def get_switches():
     try:
         conn = get_db_connection()
         cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
+        ensure_switch_sync_schema(cur)
+        conn.commit()
         cur.execute(
             """
             SELECT id_switch, nom, ip, masque, username, password, nb_ports, status, reference_id
@@ -81,13 +98,15 @@ def create_switch():
     try:
         conn = get_db_connection()
         cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
+        ensure_switch_sync_schema(cur)
+        db_password = _prepare_switch_password(cur, password)
         cur.execute(
             """
             INSERT INTO switchs (reference_id, nom, ip, masque, username, password, nb_ports, status)
             VALUES (%s, %s, %s, %s, %s, %s, %s, 'UNKNOWN')
             RETURNING id_switch, nom, ip, masque, username, password, nb_ports, status, reference_id
             """,
-            (reference, nom, ip, masque, username, password, nb_ports),
+            (reference, nom, ip, masque, username, db_password, nb_ports),
         )
         row = cur.fetchone()
         conn.commit()
@@ -117,8 +136,10 @@ def update_switch(switch_id):
     try:
         conn = get_db_connection()
         cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
+        ensure_switch_sync_schema(cur)
 
         if password:
+            db_password = _prepare_switch_password(cur, password)
             cur.execute(
                 """
                 UPDATE switchs
@@ -127,7 +148,7 @@ def update_switch(switch_id):
                 WHERE id_switch=%s
                 RETURNING id_switch, nom, ip, masque, username, password, nb_ports, status, reference_id
                 """,
-                (reference, nom, ip, masque, username, password, nb_ports, switch_id),
+                (reference, nom, ip, masque, username, db_password, nb_ports, switch_id),
             )
         else:
             cur.execute(
@@ -160,6 +181,7 @@ def delete_switch(switch_id):
     try:
         conn = get_db_connection()
         cur = conn.cursor()
+        ensure_switch_sync_schema(cur)
         cur.execute("DELETE FROM switchs WHERE id_switch=%s RETURNING id_switch", (switch_id,))
         deleted = cur.fetchone()
         conn.commit()
@@ -211,6 +233,8 @@ def get_ssh_users():
     try:
         conn = get_db_connection()
         cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
+        ensure_switch_sync_schema(cur)
+        conn.commit()
         cur.execute(
             """
             SELECT u.id_ssh_user, u.id_switch, u.username, u.privilege,
@@ -248,6 +272,7 @@ def create_ssh_user():
     try:
         conn = get_db_connection()
         cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
+        ensure_switch_sync_schema(cur)
 
         cur.execute("SELECT id_user FROM utilisateur WHERE username=%s", (username,))
         if not cur.fetchone():
@@ -294,6 +319,7 @@ def delete_ssh_user(user_id):
     try:
         conn = get_db_connection()
         cur = conn.cursor()
+        ensure_switch_sync_schema(cur)
         cur.execute(
             "DELETE FROM utilisateurs_ssh WHERE id_ssh_user=%s RETURNING id_ssh_user",
             (user_id,),

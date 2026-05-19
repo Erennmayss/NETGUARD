@@ -14,6 +14,24 @@ logger = logging.getLogger(__name__)
 SSH_TIMEOUT = int(os.getenv("NETMIKO_TIMEOUT", "12"))
 SSH_AUTH_TIMEOUT = int(os.getenv("NETMIKO_AUTH_TIMEOUT", "10"))
 SSH_BANNER_TIMEOUT = int(os.getenv("NETMIKO_BANNER_TIMEOUT", "8"))
+INTERFACE_STATUS_VALUES = {
+    "connected",
+    "notconnect",
+    "disabled",
+    "err-disabled",
+    "inactive",
+    "monitoring",
+    "sfpabsent",
+    "xcvrabsent",
+    "up",
+    "down",
+}
+
+
+def _get_row_value(row, key, index=0):
+    if hasattr(row, "get"):
+        return row.get(key)
+    return row[index]
 
 
 def invalidate_dashboard_cache():
@@ -24,17 +42,19 @@ def invalidate_dashboard_cache():
 def ensure_switch_sync_schema(cur):
     cur.execute(
         """
-        SELECT column_name
-        FROM information_schema.columns
-        WHERE table_name = 'interface'
+        CREATE TABLE IF NOT EXISTS switchs (
+            id_switch SERIAL PRIMARY KEY,
+            reference_id VARCHAR(100),
+            nom VARCHAR(100) UNIQUE NOT NULL,
+            ip VARCHAR(50) UNIQUE NOT NULL,
+            masque VARCHAR(50),
+            username VARCHAR(100) NOT NULL,
+            password TEXT NOT NULL,
+            nb_ports INT DEFAULT 24,
+            status VARCHAR(20) DEFAULT 'UNKNOWN'
+        )
         """
     )
-    interface_columns = {row[0] for row in cur.fetchall()}
-
-    if "description" not in interface_columns:
-        cur.execute("ALTER TABLE interface ADD COLUMN description TEXT")
-    if "duplex" not in interface_columns:
-        cur.execute("ALTER TABLE interface ADD COLUMN duplex VARCHAR(32)")
 
     cur.execute(
         """
@@ -43,12 +63,137 @@ def ensure_switch_sync_schema(cur):
         WHERE table_name = 'switchs'
         """
     )
-    switch_columns = {row[0] for row in cur.fetchall()}
+    switch_columns = {_get_row_value(row, "column_name") for row in cur.fetchall()}
 
+    if "status" not in switch_columns and "statut" in switch_columns:
+        cur.execute("ALTER TABLE switchs RENAME COLUMN statut TO status")
+        switch_columns.discard("statut")
+        switch_columns.add("status")
+    if "status" not in switch_columns:
+        cur.execute("ALTER TABLE switchs ADD COLUMN status VARCHAR(20) DEFAULT 'UNKNOWN'")
+    if "reference_id" not in switch_columns:
+        cur.execute("ALTER TABLE switchs ADD COLUMN reference_id VARCHAR(100)")
+    if "masque" not in switch_columns:
+        cur.execute("ALTER TABLE switchs ADD COLUMN masque VARCHAR(50)")
+    if "nb_ports" not in switch_columns:
+        cur.execute("ALTER TABLE switchs ADD COLUMN nb_ports INT DEFAULT 24")
     if "last_sync_at" not in switch_columns:
         cur.execute("ALTER TABLE switchs ADD COLUMN last_sync_at TIMESTAMPTZ")
     if "last_sync_error" not in switch_columns:
         cur.execute("ALTER TABLE switchs ADD COLUMN last_sync_error TEXT")
+
+    cur.execute(
+        """
+        CREATE TABLE IF NOT EXISTS utilisateurs_ssh (
+            id_ssh_user SERIAL PRIMARY KEY,
+            id_switch INT NOT NULL REFERENCES switchs(id_switch) ON DELETE CASCADE,
+            username VARCHAR(100) NOT NULL,
+            password BYTEA NOT NULL,
+            privilege INT DEFAULT 15,
+            UNIQUE(id_switch, username)
+        )
+        """
+    )
+
+    cur.execute(
+        """
+        CREATE TABLE IF NOT EXISTS vlan (
+            id_vlan INT PRIMARY KEY,
+            nom VARCHAR(100),
+            reseau VARCHAR(100),
+            gateway VARCHAR(100),
+            type VARCHAR(50) DEFAULT 'Data',
+            ports TEXT,
+            status VARCHAR(50) DEFAULT 'Active',
+            switch_name VARCHAR(100),
+            switch_ip VARCHAR(50)
+        )
+        """
+    )
+
+    cur.execute(
+        """
+        SELECT column_name
+        FROM information_schema.columns
+        WHERE table_name = 'vlan'
+        """
+    )
+    vlan_columns = {_get_row_value(row, "column_name") for row in cur.fetchall()}
+    for column_name, column_type in {
+        "nom": "VARCHAR(100)",
+        "reseau": "VARCHAR(100)",
+        "gateway": "VARCHAR(100)",
+        "type": "VARCHAR(50) DEFAULT 'Data'",
+        "ports": "TEXT",
+        "status": "VARCHAR(50) DEFAULT 'Active'",
+        "switch_name": "VARCHAR(100)",
+        "switch_ip": "VARCHAR(50)",
+    }.items():
+        if column_name not in vlan_columns:
+            cur.execute(f"ALTER TABLE vlan ADD COLUMN {column_name} {column_type}")
+
+    cur.execute(
+        """
+        CREATE TABLE IF NOT EXISTS interface (
+            id_interface SERIAL PRIMARY KEY,
+            nom VARCHAR(100) NOT NULL,
+            ip VARCHAR(100),
+            vlan_id INT,
+            id_switch INT REFERENCES switchs(id_switch) ON DELETE CASCADE,
+            equipement_id INT,
+            status VARCHAR(20) DEFAULT 'DOWN',
+            mode VARCHAR(20) DEFAULT 'access',
+            type VARCHAR(20) DEFAULT 'access',
+            speed VARCHAR(50),
+            allowed_vlans TEXT,
+            port_security BOOLEAN DEFAULT FALSE,
+            max_mac INT DEFAULT 1,
+            violation_mode VARCHAR(50) DEFAULT 'shutdown',
+            bpdu_guard BOOLEAN DEFAULT FALSE,
+            static_mac VARCHAR(17),
+            description TEXT,
+            duplex VARCHAR(32)
+        )
+        """
+    )
+
+    cur.execute(
+        """
+        SELECT column_name
+        FROM information_schema.columns
+        WHERE table_name = 'interface'
+        """
+    )
+    interface_columns = {_get_row_value(row, "column_name") for row in cur.fetchall()}
+
+    if "bpd_u_guard" in interface_columns and "bpdu_guard" not in interface_columns:
+        cur.execute("ALTER TABLE interface RENAME COLUMN bpd_u_guard TO bpdu_guard")
+        interface_columns.discard("bpd_u_guard")
+        interface_columns.add("bpdu_guard")
+
+    for column_name, column_type in {
+        "ip": "VARCHAR(100)",
+        "vlan_id": "INT",
+        "id_switch": "INT REFERENCES switchs(id_switch) ON DELETE CASCADE",
+        "equipement_id": "INT",
+        "status": "VARCHAR(20) DEFAULT 'DOWN'",
+        "mode": "VARCHAR(20) DEFAULT 'access'",
+        "type": "VARCHAR(20) DEFAULT 'access'",
+        "speed": "VARCHAR(50)",
+        "allowed_vlans": "TEXT",
+        "port_security": "BOOLEAN DEFAULT FALSE",
+        "max_mac": "INT DEFAULT 1",
+        "violation_mode": "VARCHAR(50) DEFAULT 'shutdown'",
+        "bpdu_guard": "BOOLEAN DEFAULT FALSE",
+        "static_mac": "VARCHAR(17)",
+        "description": "TEXT",
+        "duplex": "VARCHAR(32)",
+    }.items():
+        if column_name not in interface_columns:
+            cur.execute(f"ALTER TABLE interface ADD COLUMN {column_name} {column_type}")
+
+    cur.execute("CREATE INDEX IF NOT EXISTS idx_interface_switch_nom ON interface (id_switch, nom)")
+    cur.execute("CREATE INDEX IF NOT EXISTS idx_interface_switch_vlan ON interface (id_switch, vlan_id)")
 
 
 def _decode_secret(value):
@@ -67,28 +212,35 @@ def _normalize_port_name(value):
         return ""
 
     compact = re.sub(r"\s+", "", raw).lower()
-    replacements = (
-        ("gigabitethernet", "Gi"),
-        ("tengigabitethernet", "Te"),
-        ("fastethernet", "Fa"),
-        ("ethernet", "Eth"),
-        ("port-channel", "Po"),
-    )
-    for src, dst in replacements:
-        if compact.startswith(src):
-            return dst + raw[len(src):].strip()
-
-    if compact.startswith("gi"):
-        return "Gi" + raw[2:].strip()
-    if compact.startswith("te"):
-        return "Te" + raw[2:].strip()
-    if compact.startswith("fa"):
-        return "Fa" + raw[2:].strip()
-    if compact.startswith("po"):
-        return "Po" + raw[2:].strip()
-    if compact.startswith("eth"):
-        return "Eth" + raw[3:].strip()
+    match = re.match(r"^([a-z-]+)(.+)$", compact)
+    prefix = match.group(1) if match else ""
+    suffix = match.group(2) if match else raw
+    replacements = {
+        "gigabitethernet": "Gi",
+        "gig": "Gi",
+        "gi": "Gi",
+        "g": "Gi",
+        "tengigabitethernet": "Te",
+        "tengig": "Te",
+        "te": "Te",
+        "t": "Te",
+        "fastethernet": "Fa",
+        "fast": "Fa",
+        "fa": "Fa",
+        "f": "Fa",
+        "ethernet": "Eth",
+        "eth": "Eth",
+        "port-channel": "Po",
+        "portchannel": "Po",
+        "po": "Po",
+    }
+    if prefix in replacements:
+        return replacements[prefix] + suffix
     return raw
+
+
+def _interface_key(value):
+    return _normalize_port_name(value).lower()
 
 
 def _normalize_interface_status(value):
@@ -121,28 +273,63 @@ def _guess_speed(interface_name, reported_speed):
     return "10Gb" if _guess_interface_type(interface_name) == "uplink" else "1Gb"
 
 
+def _split_status_columns(stripped):
+    columns = re.split(r"\s{2,}", stripped)
+    if len(columns) >= 6:
+        return columns
+
+    tokens = stripped.split()
+    if len(tokens) < 6:
+        return []
+
+    status_index = next(
+        (idx for idx, token in enumerate(tokens[1:], start=1) if token.lower() in INTERFACE_STATUS_VALUES),
+        None,
+    )
+    if status_index is None or len(tokens) - status_index < 5:
+        return []
+
+    return [
+        tokens[0],
+        " ".join(tokens[1:status_index]),
+        tokens[status_index],
+        tokens[status_index + 1],
+        tokens[status_index + 2],
+        tokens[status_index + 3],
+        " ".join(tokens[status_index + 4:]),
+    ]
+
+
 def parse_show_interfaces_status(output):
     interfaces = []
+    seen = set()
 
     for raw_line in str(output or "").splitlines():
         line = raw_line.rstrip()
         stripped = line.strip()
         if not stripped:
             continue
-        if stripped.lower().startswith("port "):
+        lowered = stripped.lower()
+        if lowered.startswith("port ") or lowered.startswith("name "):
             continue
         if set(stripped) <= {"-"}:
             continue
         if not re.match(r"^[A-Za-z]+\S*", stripped):
             continue
 
-        columns = re.split(r"\s{2,}", stripped)
+        columns = _split_status_columns(stripped)
         if len(columns) < 6:
+            logger.debug("Ligne show interfaces status ignoree (format inconnu): %s", stripped)
             continue
 
         port = _normalize_port_name(columns[0])
         if not port:
             continue
+        port_key = _interface_key(port)
+        if port_key in seen:
+            logger.debug("Interface dupliquee ignoree dans show interfaces status: %s", port)
+            continue
+        seen.add(port_key)
 
         # Cisco "show interfaces status" is more stable when parsed from the right:
         # Port | [optional description...] | Status | Vlan | Duplex | Speed | Type
@@ -196,7 +383,11 @@ def parse_show_vlan_brief(output):
             vlans.append(current)
             continue
 
-        if current and re.match(r"^(?:Gi|Fa|Te|Eth|Po)\S+", stripped):
+        if current and re.match(
+            r"^(?:G|Gi|Gig|GigabitEthernet|F|Fa|FastEthernet|T|Te|TenGig|TenGigabitEthernet|Eth|Ethernet|Po|Port-channel)\S+",
+            stripped,
+            re.IGNORECASE,
+        ):
             current["ports"] = ", ".join(filter(None, [current["ports"], stripped]))
 
     for vlan in vlans:
@@ -209,6 +400,48 @@ def parse_show_vlan_brief(output):
         vlan["status"] = str(vlan["status"] or "active").upper()
 
     return vlans
+
+
+def apply_vlan_memberships_to_interfaces(interfaces, vlans):
+    interface_by_key = {_interface_key(item["nom"]): item for item in interfaces}
+    vlan_port_map = {}
+
+    for vlan in vlans:
+        vlan_id = vlan.get("id_vlan")
+        if vlan_id is None:
+            continue
+        for port_name in [item.strip() for item in str(vlan.get("ports") or "").split(",") if item.strip()]:
+            normalized_port = _normalize_port_name(port_name)
+            port_key = _interface_key(normalized_port)
+            vlan_port_map[port_key] = vlan_id
+            if port_key in interface_by_key:
+                interface = interface_by_key[port_key]
+                interface["vlan_id"] = vlan_id
+                if interface.get("mode") != "trunk":
+                    interface["mode"] = "access"
+                    interface["allowed_vlans"] = None
+            else:
+                interfaces.append(
+                    {
+                        "nom": normalized_port,
+                        "description": None,
+                        "status": "DOWN",
+                        "vlan_id": vlan_id,
+                        "mode": "access",
+                        "allowed_vlans": None,
+                        "duplex": None,
+                        "speed": _guess_speed(normalized_port, None),
+                        "type": _guess_interface_type(normalized_port),
+                    }
+                )
+                interface_by_key[port_key] = interfaces[-1]
+
+    logger.info(
+        "Association VLAN/interface: %s port(s) references par show vlan brief, %s interface(s) consolidees",
+        len(vlan_port_map),
+        len(interfaces),
+    )
+    return interfaces
 
 
 def _build_switch_device(switch_row):
@@ -255,32 +488,103 @@ def _update_switch_status(cur, switch_id, status, error_message=None):
     )
 
 
+def _refresh_vlan_ports(cur, switch_row, vlan_ids):
+    for vlan_id in {value for value in vlan_ids if value is not None}:
+        cur.execute(
+            """
+            SELECT COALESCE(STRING_AGG(nom, ', ' ORDER BY nom), '')
+            FROM interface
+            WHERE id_switch = %s
+              AND vlan_id = %s
+              AND COALESCE(mode, 'access') = 'access'
+            """,
+            (switch_row["id_switch"], vlan_id),
+        )
+        ports_value = cur.fetchone()[0] or ""
+        cur.execute(
+            """
+            UPDATE vlan
+            SET ports = %s,
+                switch_name = %s,
+                switch_ip = %s
+            WHERE id_vlan = %s
+            """,
+            (ports_value, switch_row["nom"], switch_row["ip"], vlan_id),
+        )
+
+
+def complete_vlans_from_interfaces(vlans, interfaces):
+    vlan_by_id = {item.get("id_vlan"): item for item in vlans}
+    missing_ports_by_vlan = {}
+
+    for interface in interfaces:
+        vlan_id = interface.get("vlan_id")
+        if vlan_id is None or vlan_id in vlan_by_id:
+            continue
+        missing_ports_by_vlan.setdefault(vlan_id, []).append(interface.get("nom") or "")
+
+    added = 0
+    for vlan_id, ports in sorted(missing_ports_by_vlan.items()):
+        vlans.append(
+            {
+                "id_vlan": vlan_id,
+                "nom": f"VLAN{vlan_id}",
+                "status": "ACTIVE",
+                "ports": ", ".join(port for port in ports if port),
+            }
+        )
+        added += 1
+    if added:
+        logger.info("%s VLAN(s) ajoutes depuis show interfaces status car absents de show vlan brief", added)
+    return vlans
+
+
 def _upsert_interfaces(cur, switch_row, interfaces):
     updated_count = 0
-    deleted_count = 0
     touched_vlans = set()
-    received_names = set()
+    received_keys = set()
+    existing_by_key = {}
+    duplicate_existing = 0
+
+    cur.execute(
+        """
+        SELECT id_interface, nom, vlan_id
+        FROM interface
+        WHERE id_switch = %s
+        ORDER BY id_interface ASC
+        """,
+        (switch_row["id_switch"],),
+    )
+    for interface_id, interface_name, vlan_id in cur.fetchall():
+        key = _interface_key(interface_name)
+        if key in existing_by_key:
+            duplicate_existing += 1
+            logger.warning(
+                "Doublon interface conserve sans suppression: switch=%s nom=%s id_interface=%s",
+                switch_row["id_switch"],
+                interface_name,
+                interface_id,
+            )
+            continue
+        existing_by_key[key] = {
+            "id_interface": interface_id,
+            "nom": interface_name,
+            "vlan_id": vlan_id,
+        }
 
     for item in interfaces:
         touched_vlans.add(item.get("vlan_id"))
-        received_names.add(item["nom"])
-        cur.execute(
-            """
-            SELECT id_interface
-            FROM interface
-            WHERE id_switch = %s AND nom = %s
-            ORDER BY id_interface ASC
-            LIMIT 1
-            """,
-            (switch_row["id_switch"], item["nom"]),
-        )
-        existing = cur.fetchone()
+        key = _interface_key(item["nom"])
+        received_keys.add(key)
+        existing = existing_by_key.get(key)
 
         if existing:
+            touched_vlans.add(existing.get("vlan_id"))
             cur.execute(
                 """
                 UPDATE interface
-                SET status = %s,
+                SET nom = %s,
+                    status = %s,
                     vlan_id = %s,
                     mode = %s,
                     allowed_vlans = %s,
@@ -291,6 +595,7 @@ def _upsert_interfaces(cur, switch_row, interfaces):
                 WHERE id_interface = %s
                 """,
                 (
+                    item["nom"],
                     item["status"],
                     item["vlan_id"],
                     item["mode"],
@@ -299,8 +604,16 @@ def _upsert_interfaces(cur, switch_row, interfaces):
                     item["speed"],
                     item["description"],
                     item["type"],
-                    existing[0],
+                    existing["id_interface"],
                 ),
+            )
+            logger.debug(
+                "Interface maj: switch=%s nom=%s vlan=%s status=%s mode=%s",
+                switch_row["id_switch"],
+                item["nom"],
+                item["vlan_id"],
+                item["status"],
+                item["mode"],
             )
         else:
             cur.execute(
@@ -325,86 +638,31 @@ def _upsert_interfaces(cur, switch_row, interfaces):
                     item["duplex"],
                 ),
             )
+            logger.debug(
+                "Interface creee: switch=%s nom=%s vlan=%s status=%s mode=%s",
+                switch_row["id_switch"],
+                item["nom"],
+                item["vlan_id"],
+                item["status"],
+                item["mode"],
+            )
         updated_count += 1
 
-    for vlan_id in {value for value in touched_vlans if value is not None}:
-        cur.execute(
-            """
-            SELECT COALESCE(STRING_AGG(nom, ', ' ORDER BY nom), '')
-            FROM interface
-            WHERE id_switch = %s
-              AND vlan_id = %s
-              AND COALESCE(mode, 'access') = 'access'
-            """,
-            (switch_row["id_switch"], vlan_id),
+    stale_count = len(set(existing_by_key) - received_keys)
+    if stale_count:
+        logger.info(
+            "%s interface(s) existantes non vues pendant le scan; conservees en base pour eviter une suppression incorrecte",
+            stale_count,
         )
-        ports_value = cur.fetchone()[0] or ""
-        cur.execute(
-            """
-            UPDATE vlan
-            SET ports = %s,
-                switch_name = %s,
-                switch_ip = %s
-            WHERE id_vlan = %s
-            """,
-            (ports_value, switch_row["nom"], switch_row["ip"], vlan_id),
-        )
+    if duplicate_existing:
+        logger.warning("%s doublon(s) d'interfaces detectes et conserves", duplicate_existing)
 
-    if received_names:
-        cur.execute(
-            """
-            DELETE FROM interface
-            WHERE id_switch = %s
-              AND nom <> ALL(%s)
-            RETURNING vlan_id
-            """,
-            (switch_row["id_switch"], list(received_names)),
-        )
-        deleted_rows = cur.fetchall()
-        deleted_count = len(deleted_rows)
-        touched_vlans.update(row[0] for row in deleted_rows if row[0] is not None)
-    else:
-        cur.execute(
-            """
-            DELETE FROM interface
-            WHERE id_switch = %s
-            RETURNING vlan_id
-            """,
-            (switch_row["id_switch"],),
-        )
-        deleted_rows = cur.fetchall()
-        deleted_count = len(deleted_rows)
-        touched_vlans.update(row[0] for row in deleted_rows if row[0] is not None)
-
-    for vlan_id in {value for value in touched_vlans if value is not None}:
-        cur.execute(
-            """
-            SELECT COALESCE(STRING_AGG(nom, ', ' ORDER BY nom), '')
-            FROM interface
-            WHERE id_switch = %s
-              AND vlan_id = %s
-              AND COALESCE(mode, 'access') = 'access'
-            """,
-            (switch_row["id_switch"], vlan_id),
-        )
-        ports_value = cur.fetchone()[0] or ""
-        cur.execute(
-            """
-            UPDATE vlan
-            SET ports = %s,
-                switch_name = %s,
-                switch_ip = %s
-            WHERE id_vlan = %s
-            """,
-            (ports_value, switch_row["nom"], switch_row["ip"], vlan_id),
-        )
-
-    return updated_count, deleted_count
+    _refresh_vlan_ports(cur, switch_row, touched_vlans)
+    return updated_count, stale_count
 
 
 def _upsert_vlans(cur, switch_row, vlans):
     updated_count = 0
-    deleted_count = 0
     received_vlan_ids = set()
 
     for item in vlans:
@@ -453,6 +711,13 @@ def _upsert_vlans(cur, switch_row, vlans):
                     item["id_vlan"],
                 ),
             )
+            logger.debug(
+                "VLAN maj: switch=%s vlan=%s nom=%s ports=%s",
+                switch_row["id_switch"],
+                item["id_vlan"],
+                item["nom"],
+                ports_value,
+            )
         else:
             cur.execute(
                 """
@@ -468,31 +733,32 @@ def _upsert_vlans(cur, switch_row, vlans):
                     switch_row["ip"],
                 ),
             )
+            logger.debug(
+                "VLAN cree: switch=%s vlan=%s nom=%s ports=%s",
+                switch_row["id_switch"],
+                item["id_vlan"],
+                item["nom"],
+                ports_value,
+            )
         updated_count += 1
 
-    if received_vlan_ids:
-        cur.execute(
-            """
-            DELETE FROM vlan
-            WHERE switch_ip = %s
-              AND COALESCE(TRIM(switch_ip), '') <> ''
-              AND id_vlan <> ALL(%s)
-            """,
-            (switch_row["ip"], list(received_vlan_ids)),
+    cur.execute(
+        """
+        SELECT id_vlan
+        FROM vlan
+        WHERE switch_ip = %s
+          AND COALESCE(TRIM(switch_ip), '') <> ''
+        """,
+        (switch_row["ip"],),
+    )
+    stale_count = len({row[0] for row in cur.fetchall()} - received_vlan_ids)
+    if stale_count:
+        logger.info(
+            "%s VLAN(s) existants non vus pendant le scan; conserves en base pour eviter une suppression incorrecte",
+            stale_count,
         )
-        deleted_count = cur.rowcount
-    else:
-        cur.execute(
-            """
-            DELETE FROM vlan
-            WHERE switch_ip = %s
-              AND COALESCE(TRIM(switch_ip), '') <> ''
-            """,
-            (switch_row["ip"],),
-        )
-        deleted_count = cur.rowcount
 
-    return updated_count, deleted_count
+    return updated_count, stale_count
 
 
 def sync_switch_state(switch_id):
@@ -516,7 +782,14 @@ def sync_switch_state(switch_id):
         )
 
         try:
+            logger.info("Debut test/synchronisation switch id=%s ip=%s", switch_id, switch_row["ip"])
             net_connect = ConnectHandler(**device)
+            try:
+                prompt = net_connect.find_prompt()
+                logger.info("Connexion SSH OK switch id=%s prompt=%s", switch_id, prompt)
+                net_connect.send_command("terminal length 0", read_timeout=10)
+            except Exception:
+                logger.debug("Preparation session SSH ignoree pour switch %s", switch_id, exc_info=True)
             interface_output = net_connect.send_command("show interfaces status", read_timeout=20)
             vlan_output = net_connect.send_command("show vlan brief", read_timeout=20)
         except Exception as exc:
@@ -538,6 +811,14 @@ def sync_switch_state(switch_id):
 
         parsed_interfaces = parse_show_interfaces_status(interface_output)
         parsed_vlans = parse_show_vlan_brief(vlan_output)
+        logger.info(
+            "Parsing switch %s: %s interface(s), %s VLAN(s)",
+            switch_id,
+            len(parsed_interfaces),
+            len(parsed_vlans),
+        )
+        parsed_vlans = complete_vlans_from_interfaces(parsed_vlans, parsed_interfaces)
+        parsed_interfaces = apply_vlan_memberships_to_interfaces(parsed_interfaces, parsed_vlans)
 
         switch_info = {
             "id_switch": switch_row["id_switch"],
@@ -546,20 +827,30 @@ def sync_switch_state(switch_id):
             "nb_ports": switch_row["nb_ports"],
         }
 
-        interfaces_updated, interfaces_deleted = _upsert_interfaces(cur, switch_info, parsed_interfaces)
-        vlans_updated, vlans_deleted = _upsert_vlans(cur, switch_info, parsed_vlans)
+        interfaces_updated, interfaces_stale = _upsert_interfaces(cur, switch_info, parsed_interfaces)
+        vlans_updated, vlans_stale = _upsert_vlans(cur, switch_info, parsed_vlans)
         _update_switch_status(cur, switch_id, "UP", None)
         conn.commit()
         invalidate_dashboard_cache()
+        logger.info(
+            "Synchronisation OK switch %s: interfaces_updated=%s interfaces_stale=%s vlans_updated=%s vlans_stale=%s",
+            switch_id,
+            interfaces_updated,
+            interfaces_stale,
+            vlans_updated,
+            vlans_stale,
+        )
 
         return {
             "success": True,
             "switch_status": "online",
             "status": "online",
             "interfaces_updated": interfaces_updated,
-            "interfaces_deleted": interfaces_deleted,
+            "interfaces_deleted": 0,
+            "interfaces_stale": interfaces_stale,
             "vlans_updated": vlans_updated,
-            "vlans_deleted": vlans_deleted,
+            "vlans_deleted": 0,
+            "vlans_stale": vlans_stale,
             "interfaces_count": len(parsed_interfaces),
             "vlans_count": len(parsed_vlans),
         }

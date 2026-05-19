@@ -69,6 +69,33 @@
       return normalizedVlans[0] || '';
     };
 
+    const normalizeInterfaceName = (value) => {
+      const compact = String(value || '').trim().replace(/\s+/g, '').toLowerCase();
+      const match = compact.match(/^([a-z-]+)(.+)$/);
+      if (!match) return compact;
+      const [, prefix, suffix] = match;
+      const aliases = {
+        gigabitethernet: 'gi',
+        gig: 'gi',
+        gi: 'gi',
+        g: 'gi',
+        tengigabitethernet: 'te',
+        tengig: 'te',
+        te: 'te',
+        t: 'te',
+        fastethernet: 'fa',
+        fast: 'fa',
+        fa: 'fa',
+        f: 'fa',
+        ethernet: 'eth',
+        eth: 'eth',
+        'port-channel': 'po',
+        portchannel: 'po',
+        po: 'po',
+      };
+      return `${aliases[prefix] || prefix}${suffix}`;
+    };
+
     const generateInitialPorts = (availableVlans = []) => {
       const ports = [];
       let interfaceId = 1;
@@ -316,12 +343,20 @@
 
           if (intData.success && intData.interfaces) {
             const basePorts = generateInitialPorts(currentVlans);
+            const usedInterfaceIds = new Set();
+            const usedInterfaceNames = new Set();
             const mergedPorts = basePorts.map(p => {
-              const dbMatch = intData.interfaces.find(i => i.nom === p.id);
+              const dbMatch = intData.interfaces.find(i => normalizeInterfaceName(i.nom) === normalizeInterfaceName(p.id));
+              if (dbMatch?.id_interface) usedInterfaceIds.add(dbMatch.id_interface);
+              if (dbMatch?.nom) usedInterfaceNames.add(normalizeInterfaceName(dbMatch.nom));
               return dbMatch ? mapDbInterfaceToUi(dbMatch, p) : p;
             });
             console.log('[loadInterfaces] Interfaces fusionnées:', mergedPorts);
-            setPorts(mergedPorts);
+            const extraPorts = intData.interfaces
+              .filter((i) => !usedInterfaceIds.has(i.id_interface) && !usedInterfaceNames.has(normalizeInterfaceName(i.nom)))
+              .map((i) => mapDbInterfaceToUi(i, null));
+            const allPorts = [...mergedPorts, ...extraPorts];
+            setPorts(allPorts);
             if (intData.interfaces.length === 0) {
                 console.warn(`[loadInterfaces] Aucune interface configurée trouvée pour switch_id=${swId}.`);
             }

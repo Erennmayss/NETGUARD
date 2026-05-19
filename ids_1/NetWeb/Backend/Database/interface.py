@@ -1,5 +1,6 @@
 from flask import Blueprint, jsonify, request
 from Database.db import get_db_connection
+from services.switch_sync import ensure_switch_sync_schema
 import psycopg2.extras
 import logging
 
@@ -147,6 +148,8 @@ def ensure_interface_schema():
     conn = get_db_connection()
     try:
         cur = conn.cursor()
+        ensure_switch_sync_schema(cur)
+        conn.commit()
         cur.execute("""
             SELECT column_name
             FROM information_schema.columns
