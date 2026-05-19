@@ -1,6 +1,5 @@
 from flask import Blueprint, jsonify, request
 from Database.db import get_db_connection
-from services.switch_sync import ensure_switch_sync_schema
 import ipaddress
 import logging
 import os
@@ -29,16 +28,14 @@ def get_vlan_columns(conn):
 
 
 def derive_network_from_gateway(gateway, prefix=None):
-    """
-    Calcule l adresse réseau depuis une passerelle et un préfixe CIDR.
-    Si prefix est None, retourne "" plutôt que de forcer /24.
+    """Dérive l'adresse réseau depuis une passerelle.
+    Si prefix est fourni (int), l'utilise ; sinon tente /24 par défaut.
     """
     if not gateway:
         return ""
-    if prefix is None:
-        return ""   # Pas de préfixe connu → on ne devine pas
     try:
-        return str(ipaddress.ip_network(f"{gateway}/{prefix}", strict=False))
+        cidr = int(prefix) if prefix is not None else 24
+        return str(ipaddress.ip_network(f"{gateway}/{cidr}", strict=False))
     except ValueError:
         return ""
 
@@ -241,20 +238,45 @@ def build_vlan_response(row):
     if device_count is None:
         device_count = 0
 
+def build_vlan_response(row):
+    gateway = row.get("gateway") or ""
+    device_count = row.get("device_count")
+    if device_count is None:
+        device_count = row.get("devices")
+    if device_count is None:
+        device_count = 0
+
+    # ── Extraire adresse réseau + CIDR depuis la colonne reseau ──────────────
+    reseau_raw = row.get("reseau") or ""
+    adresse_reseau = ""
+    masque_cidr    = None
+    subnet_mask    = ""
+    if reseau_raw and "/" in str(reseau_raw):
+        try:
+            net = ipaddress.ip_network(reseau_raw, strict=False)
+            adresse_reseau = str(net.network_address)
+            masque_cidr    = net.prefixlen
+            subnet_mask    = str(net.netmask)
+        except ValueError:
+            pass
+
     return {
-        "id_vlan":    row.get("id_vlan"),
-        "id":         row.get("id_vlan"),
-        "nom":        row.get("nom"),
-        "name":       row.get("nom"),
-        "reseau":     row.get("reseau") or "",
-        "gateway":    gateway,
-        "vlanIp":     gateway or "--",
-        "type":       row.get("type") or "Data",
-        "ports":      row.get("ports_display") or row.get("ports") or "",
-        "status":     row.get("status") or "Active",
-        "switchName": row.get("switch_name") or "",
-        "switchIp":   row.get("switch_ip") or "",
-        "devices":    device_count,
+        "id_vlan":       row.get("id_vlan"),
+        "id":            row.get("id_vlan"),
+        "nom":           row.get("nom"),
+        "name":          row.get("nom"),
+        "reseau":        reseau_raw,
+        "adresse_reseau": adresse_reseau,
+        "masque_cidr":   masque_cidr,
+        "subnet_mask":   subnet_mask,
+        "gateway":       gateway,
+        "vlanIp":        gateway or "--",
+        "type":          row.get("type") or "Data",
+        "ports":         row.get("ports_display") or row.get("ports") or "",
+        "status":        row.get("status") or "Active",
+        "switchName":    row.get("switch_name") or "",
+        "switchIp":      row.get("switch_ip") or "",
+        "devices":       device_count,
     }
 
 
@@ -660,6 +682,56 @@ def load_devices_from_database(cur, vlan_id):
     ]
 
 
+
+# ── Réseau global de référence ────────────────────────────────────────────────
+GLOBAL_NETWORK = ipaddress.ip_network("10.10.0.0/16", strict=False)
+
+
+def validate_subnet_belongs_to_global(reseau_cidr: str):
+    """Vérifie que reseau_cidr est un sous-réseau de GLOBAL_NETWORK (10.10.0.0/16).
+    Lève ValueError si la vérification échoue.
+    """
+    try:
+        subnet = ipaddress.ip_network(reseau_cidr, strict=False)
+    except ValueError:
+        raise ValueError(f"reseau doit être au format CIDR, ex: 10.10.1.0/24 (reçu : {reseau_cidr})")
+
+    if not subnet.subnet_of(GLOBAL_NETWORK):
+        raise ValueError(
+            f"Le sous-réseau {reseau_cidr} n'appartient pas au réseau global "
+            f"{GLOBAL_NETWORK}. Tous les VLANs doivent être dans 10.10.0.0/16."
+        )
+    return subnet
+
+
+def check_subnet_overlap(reseau_cidr: str, conn, excluded_vlan_id=None):
+    """Vérifie qu'aucun VLAN existant ne chevauche reseau_cidr.
+    excluded_vlan_id permet d'exclure le VLAN en cours de mise à jour.
+    """
+    new_net = ipaddress.ip_network(reseau_cidr, strict=False)
+    cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
+    try:
+        if excluded_vlan_id is not None:
+            cur.execute("SELECT id_vlan, reseau FROM vlan WHERE reseau IS NOT NULL AND id_vlan <> %s", (excluded_vlan_id,))
+        else:
+            cur.execute("SELECT id_vlan, reseau FROM vlan WHERE reseau IS NOT NULL")
+        for row in cur.fetchall():
+            existing_cidr = row.get("reseau") or ""
+            if not existing_cidr or "/" not in existing_cidr:
+                continue
+            try:
+                existing_net = ipaddress.ip_network(existing_cidr, strict=False)
+            except ValueError:
+                continue
+            if new_net.overlaps(existing_net):
+                raise ValueError(
+                    f"Chevauchement de sous-réseaux : {reseau_cidr} chevauche "
+                    f"le VLAN {row.get('id_vlan')} ({existing_cidr})."
+                )
+    finally:
+        cur.close()
+
+
 def normalize_vlan_payload(data, forced_vlan_id=None):
     if not isinstance(data, dict):
         raise ValueError("Le corps JSON est invalide")
@@ -671,17 +743,38 @@ def normalize_vlan_payload(data, forced_vlan_id=None):
         raise ValueError("id_vlan doit être un entier")
 
     gateway = str(data.get("gateway", data.get("vlanIp", data.get("vlan_ip", "")))).strip()
-    reseau  = str(data.get("reseau", "")).strip()
-    # Récupérer le préfixe CIDR explicite envoyé par le frontend
-    raw_prefix = data.get("masque_cidr", data.get("cidr", data.get("prefix")))
-    try:
-        explicit_prefix = int(raw_prefix) if raw_prefix not in (None, "") else None
-    except (TypeError, ValueError):
-        explicit_prefix = None
 
-    if not reseau and gateway:
-        # Dériver uniquement si le préfixe est connu, sinon laisser vide
-        reseau = derive_network_from_gateway(gateway, explicit_prefix)
+    # ── Réseau : priorité à reseau, sinon adresse_reseau+masque_cidr, sinon gateway+cidr ──
+    reseau = str(data.get("reseau", "")).strip()
+    masque_cidr = data.get("masque_cidr")
+    adresse_reseau = str(data.get("adresse_reseau", "")).strip()
+
+    if not reseau:
+        if adresse_reseau and masque_cidr is not None:
+            try:
+                cidr = int(masque_cidr)
+                reseau = str(ipaddress.ip_network(f"{adresse_reseau}/{cidr}", strict=False))
+            except (ValueError, TypeError):
+                reseau = ""
+        elif gateway and masque_cidr is not None:
+            try:
+                cidr = int(masque_cidr)
+                reseau = derive_network_from_gateway(gateway, cidr)
+            except (ValueError, TypeError):
+                reseau = derive_network_from_gateway(gateway)
+        elif gateway:
+            reseau = derive_network_from_gateway(gateway)
+
+    # ── Extraire subnet_mask depuis reseau si non fourni ─────────────────────
+    subnet_mask = str(data.get("subnet_mask", "")).strip()
+    if not subnet_mask and reseau and "/" in reseau:
+        try:
+            net = ipaddress.ip_network(reseau, strict=False)
+            subnet_mask = str(net.netmask)
+            if masque_cidr is None:
+                masque_cidr = net.prefixlen
+        except ValueError:
+            pass
 
     raw_id_switch = data.get("id_switch", data.get("switch_id"))
     id_switch = None if raw_id_switch in (None, "", "all") else raw_id_switch
@@ -692,32 +785,52 @@ def normalize_vlan_payload(data, forced_vlan_id=None):
             raise ValueError("id_switch doit etre un entier")
 
     payload = {
-        "id_vlan":     id_vlan,
-        "nom":         str(data.get("nom", data.get("name", data.get("vlan_name", "")))).strip(),
-        "reseau":      reseau,
-        "gateway":     gateway,
-        "type":        str(data.get("type", "Data")).strip() or "Data",
-        "ports":       str(data.get("ports", "")).strip(),
-        "status":      str(data.get("status", "Active")).strip() or "Active",
-        "switch_name": str(data.get("switchName", data.get("switch_name", ""))).strip(),
-        "switch_ip":   str(data.get("switchIp",   data.get("switch_ip",   ""))).strip(),
-        "id_switch":   id_switch,
+        "id_vlan":       id_vlan,
+        "nom":           str(data.get("nom", data.get("name", data.get("vlan_name", "")))).strip(),
+        "reseau":        reseau,
+        "adresse_reseau": adresse_reseau or (reseau.split("/")[0] if reseau else ""),
+        "masque_cidr":   masque_cidr,
+        "subnet_mask":   subnet_mask,
+        "gateway":       gateway,
+        "type":          str(data.get("type", "Data")).strip() or "Data",
+        "ports":         str(data.get("ports", "")).strip(),
+        "status":        str(data.get("status", "Active")).strip() or "Active",
+        "switch_name":   str(data.get("switchName", data.get("switch_name", ""))).strip(),
+        "switch_ip":     str(data.get("switchIp",   data.get("switch_ip",   ""))).strip(),
+        "id_switch":     id_switch,
     }
 
     if not payload["nom"]:
         raise ValueError("Le nom du VLAN est requis")
 
+    # ── Validation gateway ────────────────────────────────────────────────────
     if payload["gateway"]:
         try:
-            ipaddress.ip_address(payload["gateway"])
+            gw_addr = ipaddress.ip_address(payload["gateway"])
         except ValueError:
             raise ValueError("gateway doit être une adresse IP valide")
+        # Vérifier que la passerelle appartient au réseau global 10.10.0.0/16
+        if gw_addr not in GLOBAL_NETWORK:
+            raise ValueError(
+                f"La passerelle {payload['gateway']} n'appartient pas au réseau "
+                f"global {GLOBAL_NETWORK}."
+            )
+        # Vérifier cohérence gateway / sous-réseau VLAN
+        if payload["reseau"]:
+            try:
+                vlan_net = ipaddress.ip_network(payload["reseau"], strict=False)
+                if gw_addr not in vlan_net:
+                    raise ValueError(
+                        f"La passerelle {payload['gateway']} n'appartient pas "
+                        f"au sous-réseau VLAN {payload['reseau']}."
+                    )
+            except ValueError as e:
+                if "passerelle" in str(e):
+                    raise
 
+    # ── Validation réseau VLAN → doit être sous-réseau de 10.10.0.0/16 ───────
     if payload["reseau"]:
-        try:
-            ipaddress.ip_network(payload["reseau"], strict=False)
-        except ValueError:
-            raise ValueError("reseau doit être au format CIDR, ex: 192.168.10.0/24")
+        validate_subnet_belongs_to_global(payload["reseau"])
 
     return payload
 
@@ -726,6 +839,7 @@ def get_returning_fields(columns):
     fields = ["id_vlan", "nom", "reseau", "gateway", "type", "ports", "status"]
     fields.append("switch_name" if "switch_name" in columns else "NULL AS switch_name")
     fields.append("switch_ip"   if "switch_ip"   in columns else "NULL AS switch_ip")
+    fields.append("subnet_mask" if "subnet_mask" in columns else "NULL AS subnet_mask")
     return fields
 
 
@@ -741,8 +855,6 @@ def get_vlans():
     try:
         columns = get_vlan_columns(conn)
         cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
-        ensure_switch_sync_schema(cur)
-        conn.commit()
 
         where_clauses = []
         params = []
@@ -809,8 +921,6 @@ def get_switchs():
     conn = get_db_connection()
     try:
         cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
-        ensure_switch_sync_schema(cur)
-        conn.commit()
         cur.execute("""
             SELECT id_switch, nom, ip, status
             FROM switchs
@@ -920,6 +1030,19 @@ def create_vlan():
         if cur.fetchone():
             return jsonify({"success": False, "error": f"Le VLAN {payload['id_vlan']} existe déjà"}), 409
 
+        # ── Migration : ajouter subnet_mask si absent ─────────────────────────
+        if "subnet_mask" not in columns:
+            cur.execute("ALTER TABLE vlan ADD COLUMN IF NOT EXISTS subnet_mask VARCHAR(20)")
+            columns.add("subnet_mask")
+
+        # ── Vérification chevauchement de sous-réseaux ────────────────────────
+        if payload["reseau"]:
+            try:
+                check_subnet_overlap(payload["reseau"], conn)
+            except ValueError as e:
+                conn.rollback()
+                return jsonify({"success": False, "error": str(e)}), 409
+
         try:
             payload["ports"] = validate_port_assignments(
                 cur,
@@ -947,6 +1070,9 @@ def create_vlan():
         if "switch_ip" in columns:
             insert_columns.append("switch_ip")
             insert_values.append(payload["switch_ip"])
+        if "subnet_mask" in columns:
+            insert_columns.append("subnet_mask")
+            insert_values.append(payload["subnet_mask"] or None)
 
         # ── 1. Déploiement SSH sur le switch (AVANT le commit BDD) ───────────
         deploy_result = {"success": False, "error": "Déploiement non tenté"}
@@ -1023,6 +1149,19 @@ def update_vlan(id_vlan):
             conn.rollback()
             return jsonify({"success": False, "error": str(e)}), 400
 
+        # ── Migration : ajouter subnet_mask si absent ─────────────────────────
+        if "subnet_mask" not in columns:
+            cur.execute("ALTER TABLE vlan ADD COLUMN IF NOT EXISTS subnet_mask VARCHAR(20)")
+            columns.add("subnet_mask")
+
+        # ── Vérification chevauchement (hors le VLAN lui-même) ───────────────
+        if payload["reseau"]:
+            try:
+                check_subnet_overlap(payload["reseau"], conn, excluded_vlan_id=id_vlan)
+            except ValueError as e:
+                conn.rollback()
+                return jsonify({"success": False, "error": str(e)}), 409
+
         set_clauses = ["nom = %s", "reseau = %s", "gateway = %s", "type = %s", "ports = %s", "status = %s"]
         values      = [payload["nom"], payload["reseau"] or None, payload["gateway"] or None,
                        payload["type"], payload["ports"], payload["status"]]
@@ -1033,6 +1172,9 @@ def update_vlan(id_vlan):
         if "switch_ip" in columns:
             set_clauses.append("switch_ip = %s")
             values.append(payload["switch_ip"])
+        if "subnet_mask" in columns:
+            set_clauses.append("subnet_mask = %s")
+            values.append(payload["subnet_mask"] or None)
 
         values.append(id_vlan)
         cur.execute(f"""
