@@ -691,7 +691,7 @@
                 <div className="log-row" key={`alert-${index}`}>
                   <span className="log-time">{formatDateTime(alert.timestamp)}</span>
                   <span className="log-msg">
-                    <strong>{alert.name}</strong> - {alert.src} -> {alert.dst}
+                    <strong>{alert.name}</strong> - {alert.src} {'->'} {alert.dst}
                   </span>
                   <span className={`log-tag ${getSeverityClass(alert.severity)}`}>
                     {getSeverityLabel(alert.severity)}

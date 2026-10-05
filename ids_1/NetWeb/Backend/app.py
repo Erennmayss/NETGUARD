@@ -1,14 +1,18 @@
 from datetime import timedelta
 import logging
 import os
+import re
 
+from dotenv import load_dotenv
 from flask import Flask, send_from_directory
 from flask_cors import CORS
 from flask_jwt_extended import JWTManager
 
+# ── Imports des Blueprints & Services ─────────────────────────────────────────
 from auth import auth_bp
+from dashboard_api import dashboard_bp
 from Database.alerts import alerts_bp
-from Database.interface import interface_bp, initialize_default_interfaces
+from Database.interface import initialize_default_interfaces, interface_bp
 from Database.regles import regles_bp
 from Database.traffic import traffic_bp
 from Database.vlan import vlan_bp
@@ -17,30 +21,34 @@ from log_api import log_bp
 from network_api import network_bp
 from run_bat_api import run_bat_bp
 from users import users_bp
-from dashboard_api import dashboard_bp
 
+# ── Configuration des Répertoires & Environnement ────────────────────────────
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
-FRONTEND_DIR = os.path.normpath(os.path.join(BASE_DIR, "..", "Frontend"))
+FRONTEND_DIR = os.path.abspath(os.path.join(BASE_DIR, "..", "Frontend"))
+
+# Charger automatiquement le fichier .env
+load_dotenv(os.path.join(BASE_DIR, ".env"), override=True)
 
 
 def _get_cors_origins():
     raw_origins = os.getenv("CORS_ORIGINS", "").strip()
-    if not raw_origins:
-        return "*"
     origins = [origin.strip() for origin in raw_origins.split(",") if origin.strip()]
-    vercel_origin_pattern = r"https://.*\.vercel\.app"
-    if vercel_origin_pattern not in origins:
-        origins.append(vercel_origin_pattern)
-    return origins
+    
+    # Expression régulière compilée requise par Flask-CORS pour le wildcard Vercel
+    vercel_origin_pattern = re.compile(r"https://.*\.vercel\.app")
+    origins.append(vercel_origin_pattern)
+    
+    return origins if raw_origins else "*"
 
 
 def _get_jwt_secret():
     secret = os.getenv("JWT_SECRET_KEY", "").strip()
     if not secret:
-        raise RuntimeError("JWT_SECRET_KEY manquant. Configurez-le avant de lancer l'application.")
+        raise RuntimeError("JWT_SECRET_KEY manquant dans le .env. Configurez-le avant de lancer l'application.")
     return secret
 
 
+# ── Initialisation de l'application Flask ──────────────────────────────────────
 app = Flask(__name__, static_folder=FRONTEND_DIR, static_url_path="")
 app.url_map.strict_slashes = False
 logging.basicConfig(level=logging.INFO)
@@ -51,6 +59,7 @@ app.config["JWT_SECRET_KEY"] = _get_jwt_secret()
 app.config["JWT_ACCESS_TOKEN_EXPIRES"] = timedelta(hours=8)
 jwt = JWTManager(app)
 
+# ── Enregistrement des Blueprints ─────────────────────────────────────────────
 app.register_blueprint(users_bp)
 app.register_blueprint(auth_bp)
 app.register_blueprint(dashboard_bp)
@@ -64,14 +73,13 @@ app.register_blueprint(equipements_bp)
 app.register_blueprint(run_bat_bp)
 app.register_blueprint(log_bp)
 
-
 try:
     initialize_default_interfaces()
 except Exception as exc:
     app.logger.error("Initialisation des interfaces impossible: %s", exc)
 
 
-# ── Endpoint de santé (utilisé par le notifier) ──────────────────────────────
+# ── Endpoints API & Service Frontend ──────────────────────────────────────────
 @app.get("/api/health")
 def health():
     return {"status": "ok"}, 200
@@ -84,8 +92,9 @@ def serve_index():
 
 @app.get("/<path:path>")
 def serve_frontend(path):
-    target = os.path.normpath(os.path.join(FRONTEND_DIR, path))
+    target = os.path.abspath(os.path.join(FRONTEND_DIR, path))
 
+    # Prévention des attaques par traversée de répertoire
     if not target.startswith(FRONTEND_DIR):
         return {"error": "Chemin invalide"}, 404
 
